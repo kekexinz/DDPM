@@ -10,6 +10,7 @@ from ddpm import script_utils
 
 def main():
     args = create_argparser().parse_args()
+    print(args.schedule)
     device = args.device
 
     try:
@@ -23,15 +24,15 @@ def main():
 
         batch_size = args.batch_size
 
-        train_dataset = datasets.CIFAR10(
-            root='./cifar_train',
+        train_dataset = datasets.MNIST(
+            root='./data',
             train=True,
             download=True,
             transform=script_utils.get_transform(),
         )
 
-        test_dataset = datasets.CIFAR10(
-            root='./cifar_test',
+        test_dataset = datasets.MNIST(
+            root='./data',
             train=False,
             download=True,
             transform=script_utils.get_transform(),
@@ -131,14 +132,13 @@ def create_argparser():
     run_name = datetime.datetime.now().strftime("ddpm-%Y-%m-%d-%H-%M")
     defaults = dict(
         learning_rate=2e-4,
-        batch_size=128,
+        batch_size=64,
         iterations=1000,
         log_rate=10,
         checkpoint_rate=100,
         log_dir="./ddpm_logs",
         project_name=None,
         run_name=run_name,
-
         model_checkpoint=None,
         optim_checkpoint=None,
 
