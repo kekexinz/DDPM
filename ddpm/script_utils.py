@@ -1,8 +1,9 @@
 import argparse
 import torchvision
 import torch.nn.functional as F
-
+import functools
 from .unet import UNet
+from .utils import marginal_prob_std
 from .diffusion import (
     GaussianDiffusion,
     generate_linear_schedule,
@@ -58,19 +59,21 @@ def add_dict_to_argparser(parser, default_dict):
 
 def diffusion_defaults():
     defaults = dict(
-        num_timesteps=1000,
+        num_timesteps=100,
         schedule="linear",
+        schedule_low=1e-4,
+        schedule_high=0.02,
         loss_type="l2",
         use_labels=False,
-
-        base_channels=128,
-        channel_mults=(1, 2, 2, 2),
-        num_res_blocks=2,
-        time_emb_dim=128 * 4,
+        channels=[32, 64, 128, 256],
+        #base_channels=16,
+        #channel_mults=(1, 2, 2),
+        num_res_blocks=1,
+        time_emb_dim=128,
         norm="gn",
         dropout=0.1,
         activation="silu",
-        attention_resolutions=(1,),
+        #attention_resolutions=(1,),
 
         ema_decay=0.9999,
         ema_update_rate=1,
@@ -86,24 +89,18 @@ def get_diffusion_from_args(args):
         "silu": F.silu,
     }
 
+    sigma = 25.0
+    marginal_prob_std_fn = functools.partial(marginal_prob_std, sigma=sigma)
+
     model = UNet(
-        img_channels=3,
-
-        base_channels=args.base_channels,
-        channel_mults=args.channel_mults,
+        marginal_prob_std = marginal_prob_std_fn,
         time_emb_dim=args.time_emb_dim,
-        norm=args.norm,
-        dropout=args.dropout,
-        activation=activations[args.activation],
-        attention_resolutions=args.attention_resolutions,
-
         num_classes=None if not args.use_labels else 10,
-        initial_pad=0,
     )
 
     if args.schedule == "cosine":
         betas = generate_cosine_schedule(args.num_timesteps)
-    else:
+    if args.schedule == "linear":
         betas = generate_linear_schedule(
             args.num_timesteps,
             args.schedule_low * 1000 / args.num_timesteps,
@@ -111,7 +108,7 @@ def get_diffusion_from_args(args):
         )
 
     diffusion = GaussianDiffusion(
-        model, (32, 32), 3, 10,
+        model, (28, 28), 1, None,
         betas,
         ema_decay=args.ema_decay,
         ema_update_rate=args.ema_update_rate,

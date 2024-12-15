@@ -10,9 +10,10 @@ from ddpm import script_utils
 
 def main():
     args = create_argparser().parse_args()
-    print(args.schedule)
     device = args.device
-
+    print(args.time_emb_dim)
+    print(args.learning_rate)
+    print(args.batch_size)
     try:
         diffusion = script_utils.get_diffusion_from_args(args).to(device)
         optimizer = torch.optim.Adam(diffusion.parameters(), lr=args.learning_rate)
@@ -46,6 +47,8 @@ def main():
             num_workers=2,
         ))
         test_loader = DataLoader(test_dataset, batch_size=batch_size, drop_last=True, num_workers=2)
+
+        print("Starting training")
         
         acc_train_loss = 0
 
@@ -131,11 +134,12 @@ def create_argparser():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     run_name = datetime.datetime.now().strftime("ddpm-%Y-%m-%d-%H-%M")
     defaults = dict(
-        learning_rate=2e-4,
-        batch_size=64,
+        learning_rate=10e-4,
+        batch_size=1024,
         iterations=1000,
         log_rate=10,
-        checkpoint_rate=100,
+        time_emb_dim=128,
+        checkpoint_rate=1000,
         log_dir="./ddpm_logs",
         project_name=None,
         run_name=run_name,

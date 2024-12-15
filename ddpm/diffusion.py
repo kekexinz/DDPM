@@ -114,11 +114,17 @@ class GaussianDiffusion(nn.Module):
         return x.cpu().detach()
 
     @torch.no_grad()
-    def sample_diffusion_sequence(self, batch_size, device, y=None, use_ema=True):
+    def sample_diffusion_sequence(self, batch_size, device, y=None, noisy_image=None, use_ema=True):
         if y is not None and batch_size != len(y):
             raise ValueError("sample batch size different from length of given y")
 
-        x = torch.randn(batch_size, self.img_channels, *self.img_size, device=device)
+        if noisy_image is not None:
+            if noisy_image.shape[0] != batch_size:
+                raise ValueError("sample batch size different from length of given noisy_image")
+            x = noisy_image.to(device)
+        else:
+            x = torch.randn(batch_size, self.img_channels, *self.img_size, device=device)
+
         diffusion_sequence = [x.cpu().detach()]
         
         for t in range(self.num_timesteps - 1, -1, -1):
@@ -134,6 +140,7 @@ class GaussianDiffusion(nn.Module):
 
     def perturb_x(self, x, t, noise):
         return (
+            # sqrt(alpha_t) * x_{t} + sqrt(1 - alpha_t) * noise
             extract(self.sqrt_alphas_cumprod, t, x.shape) * x +
             extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * noise
         )   

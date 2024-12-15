@@ -5,6 +5,9 @@ import torch.nn.functional as F
 
 from torch.nn.modules.normalization import GroupNorm
 
+from .utils import Dense, GaussianFourierProjection
+from .attention import SpatialTransformer
+
 
 def get_norm(norm, num_channels, num_groups):
     if norm == "in":
@@ -47,31 +50,6 @@ class PositionalEmbedding(nn.Module):
         return emb
 
 
-class Downsample(nn.Module):
-    __doc__ = r"""Downsamples a given tensor by a factor of 2. Uses strided convolution. Assumes even height and width.
-
-    Input:
-        x: tensor of shape (N, in_channels, H, W)
-        time_emb: ignored
-        y: ignored
-    Output:
-        tensor of shape (N, in_channels, H // 2, W // 2)
-    Args:
-        in_channels (int): number of input channels
-    """
-
-    def __init__(self, in_channels):
-        super().__init__()
-
-        self.downsample = nn.Conv2d(in_channels, in_channels, 3, stride=2, padding=1)
-    
-    def forward(self, x, time_emb, y):
-        if x.shape[2] % 2 == 1:
-            raise ValueError("downsampling tensor height should be even")
-        if x.shape[3] % 2 == 1:
-            raise ValueError("downsampling tensor width should be even")
-
-        return self.downsample(x)
 
 
 class Upsample(nn.Module):
@@ -139,7 +117,7 @@ class AttentionBlock(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    __doc__ = r"""Applies two conv blocks with resudual connection. Adds time and class conditioning by adding bias after first convolution.
+    __doc__ = r"""Applies two conv blocks with resudual/skip connection. Adds time and class conditioning by adding bias after first convolution.
 
     Input:
         x: tensor of shape (N, in_channels, H, W)
@@ -205,7 +183,7 @@ class ResidualBlock(nn.Module):
             out += self.class_bias(y)[:, :, None, None]
 
         out = self.activation(self.norm_2(out))
-        out = self.conv_2(out) + self.residual_connection(x)
+        out = self.conv_2(out) + self.residual_connection(x) # skip connection implemented
         out = self.attention(out)
 
         return out
@@ -237,150 +215,87 @@ class UNet(nn.Module):
 
     def __init__(
         self,
-        img_channels,
-        base_channels,
-        channel_mults=(1, 2, 4, 8),
-        num_res_blocks=2,
-        time_emb_dim=None,
+        marginal_prob_std,
+        channels = [32, 64, 128, 256],
+        num_res_blocks=1,
+        time_emb_dim=256,
+        text_dim=256,
         time_emb_scale=1.0,
         num_classes=None,
-        activation=F.relu,
-        dropout=0.1,
-        attention_resolutions=(),
-        norm="gn",
         num_groups=32,
-        initial_pad=0,
     ):
         super().__init__()
 
-        self.activation = activation
-        self.initial_pad = initial_pad
-
         self.num_classes = num_classes
-        self.time_mlp = nn.Sequential(
-            PositionalEmbedding(base_channels, time_emb_scale),
-            nn.Linear(base_channels, time_emb_dim),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
-        ) if time_emb_dim is not None else None
+        self.time_embed = nn.Sequential(
+            GaussianFourierProjection(embed_dim=time_emb_dim),
+            nn.Linear(time_emb_dim, time_emb_dim)
+        )
+
+        self.cond_embed = nn.Embedding(num_classes, text_dim) if num_classes is not None else None
     
-        self.init_conv = nn.Conv2d(img_channels, base_channels, 3, padding=1)
+        # Other model properties
+        self.act = nn.SiLU()
+        self.marginal_prob_std = marginal_prob_std
 
-        self.downs = nn.ModuleList()
-        self.ups = nn.ModuleList()
+        # Encoding layers
+        self.conv1 = nn.Conv2d(1, channels[0], 3, stride=1, bias=False)
+        self.dense1 = Dense(time_emb_dim, channels[0])
+        self.gnorm1 = nn.GroupNorm(4, num_channels=channels[0])
 
-        channels = [base_channels]
-        now_channels = base_channels
+        self.conv2 = nn.Conv2d(channels[0], channels[1], 3, stride=2, bias=False)
+        self.dense2 = Dense(time_emb_dim, channels[1])
+        self.gnorm2 = nn.GroupNorm(32, num_channels=channels[1])
 
-        for i, mult in enumerate(channel_mults):
-            out_channels = base_channels * mult
+        self.conv3 = nn.Conv2d(channels[1], channels[2], 3, stride=2, bias=False)
+        self.dense3 = Dense(time_emb_dim, channels[2])
+        self.gnorm3 = nn.GroupNorm(32, num_channels=channels[2])
+        self.attn3 = SpatialTransformer(channels[2], text_dim)
 
-            for _ in range(num_res_blocks):
-                self.downs.append(ResidualBlock(
-                    now_channels,
-                    out_channels,
-                    dropout,
-                    time_emb_dim=time_emb_dim,
-                    num_classes=num_classes,
-                    activation=activation,
-                    norm=norm,
-                    num_groups=num_groups,
-                    use_attention=i in attention_resolutions,
-                ))
-                now_channels = out_channels
-                channels.append(now_channels)
-            
-            if i != len(channel_mults) - 1:
-                self.downs.append(Downsample(now_channels))
-                channels.append(now_channels)
-        
+        self.conv4 = nn.Conv2d(channels[2], channels[3], 3, stride=2, bias=False)
+        self.dense4 = Dense(time_emb_dim, channels[3])
+        self.gnorm4 = nn.GroupNorm(32, num_channels=channels[3])
+        self.attn4 = SpatialTransformer(channels[3], text_dim)
 
-        self.mid = nn.ModuleList([
-            ResidualBlock(
-                now_channels,
-                now_channels,
-                dropout,
-                time_emb_dim=time_emb_dim,
-                num_classes=num_classes,
-                activation=activation,
-                norm=norm,
-                num_groups=num_groups,
-                use_attention=True,
-            ),
-            ResidualBlock(
-                now_channels,
-                now_channels,
-                dropout,
-                time_emb_dim=time_emb_dim,
-                num_classes=num_classes,
-                activation=activation,
-                norm=norm,
-                num_groups=num_groups,
-                use_attention=False,
-            ),
-        ])
+        # Decoding layers
+        self.tconv4 = nn.ConvTranspose2d(channels[3], channels[2], 3, stride=2, bias=False)
+        self.dense5 = Dense(time_emb_dim, channels[2])
+        self.tgnorm4 = nn.GroupNorm(32, num_channels=channels[2])
 
-        for i, mult in reversed(list(enumerate(channel_mults))):
-            out_channels = base_channels * mult
+        self.tconv3 = nn.ConvTranspose2d(channels[2], channels[1], 3, stride=2, bias=False, output_padding=1)
+        self.dense6 = Dense(time_emb_dim, channels[1])
+        self.tgnorm3 = nn.GroupNorm(32, num_channels=channels[1])
 
-            for _ in range(num_res_blocks + 1):
-                self.ups.append(ResidualBlock(
-                    channels.pop() + now_channels,
-                    out_channels,
-                    dropout,
-                    time_emb_dim=time_emb_dim,
-                    num_classes=num_classes,
-                    activation=activation,
-                    norm=norm,
-                    num_groups=num_groups,
-                    use_attention=i in attention_resolutions,
-                ))
-                now_channels = out_channels
-            
-            if i != 0:
-                self.ups.append(Upsample(now_channels))
-        
-        assert len(channels) == 0
-        
-        self.out_norm = get_norm(norm, base_channels, num_groups)
-        self.out_conv = nn.Conv2d(base_channels, img_channels, 3, padding=1)
+        self.tconv2 = nn.ConvTranspose2d(channels[1], channels[0], 3, stride=2, bias=False, output_padding=1)
+        self.dense7 = Dense(time_emb_dim, channels[0])
+        self.tgnorm2 = nn.GroupNorm(32, num_channels=channels[0])
+
+        self.tconv1 = nn.ConvTranspose2d(channels[0], 1, 3, stride=1)
     
-    def forward(self, x, time=None, y=None):
-        ip = self.initial_pad
-        if ip != 0:
-            x = F.pad(x, (ip,) * 4)
-
-        if self.time_mlp is not None:
-            if time is None:
-                raise ValueError("time conditioning was specified but tim is not passed")
+    
+    def forward(self, x, time, y=None):
+        time_emb = self.act(self.time_embed(time))
+        if self.num_classes is not None:
+            if y is None:
+                raise ValueError("class conditioning was specified but y is not passed")
             
-            time_emb = self.time_mlp(time)
+            y_embed = self.cond_embed(y).unsqueeze(1)
+
         else:
-            time_emb = None
+            y_embed = None
         
-        if self.num_classes is not None and y is None:
-            raise ValueError("class conditioning was specified but y is not passed")
-        
-        x = self.init_conv(x)
+        # Encoding layers
+        h1 = self.act(self.gnorm1(self.conv1(x) + self.dense1(time_emb)))
+        h2 = self.act(self.gnorm2(self.conv2(h1) + self.dense2(time_emb)))
+        h3 = self.act(self.gnorm3(self.conv3(h2) + self.dense3(time_emb)))
+        h3 = self.attn3(h3, y_embed)
+        h4 = self.act(self.gnorm4(self.conv4(h3) + self.dense4(time_emb)))
+        h4 = self.attn4(h4, y_embed)
 
-        skips = [x]
+        # Decoding
+        h = self.act(self.tgnorm4(self.tconv4(h4) + self.dense5(time_emb)))
+        h = self.act(self.tgnorm3(self.tconv3(h + h3) + self.dense6(time_emb)))
+        h = self.act(self.tgnorm2(self.tconv2(h + h2) + self.dense7(time_emb)))
+        h = self.tconv1(h + h1)
 
-        for layer in self.downs:
-            x = layer(x, time_emb, y)
-            skips.append(x)
-        
-        for layer in self.mid:
-            x = layer(x, time_emb, y)
-        
-        for layer in self.ups:
-            if isinstance(layer, ResidualBlock):
-                x = torch.cat([x, skips.pop()], dim=1)
-            x = layer(x, time_emb, y)
-
-        x = self.activation(self.out_norm(x))
-        x = self.out_conv(x)
-        
-        if self.initial_pad != 0:
-            return x[:, :, ip:-ip, ip:-ip]
-        else:
-            return x
+        return h

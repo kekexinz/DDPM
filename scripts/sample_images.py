@@ -60,7 +60,7 @@ def main():
         else:
             print("Sampling images")
             samples = diffusion.sample_diffusion_sequence(args.num_images, device)
-            save_diffusion_sequence_as_gif(samples, args.save_dir)
+            save_diffusion_sequence_as_gif(samples, args.save_dir, gif_name="random_diffusion_process.gif")
             #for image_id in range(len(samples)):
             #    image = ((samples[image_id] + 1) / 2).clip(0, 1)
             #    torchvision.utils.save_image(image, f"{args.save_dir}/test_{image_id}.png")
