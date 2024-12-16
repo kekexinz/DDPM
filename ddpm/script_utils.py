@@ -64,7 +64,7 @@ def diffusion_defaults():
         schedule_low=1e-4,
         schedule_high=0.02,
         loss_type="l2",
-        use_labels=False,
+        use_labels=True,
         channels=[32, 64, 128, 256],
         #base_channels=16,
         #channel_mults=(1, 2, 2),
@@ -114,6 +114,7 @@ def get_diffusion_from_args(args):
         ema_update_rate=args.ema_update_rate,
         ema_start=2000,
         loss_type=args.loss_type,
+        marginal_prob_std_fn=marginal_prob_std_fn,
     )
 
     return diffusion

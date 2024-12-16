@@ -9,6 +9,9 @@ from copy import deepcopy
 from .ema import EMA
 from .utils import extract
 
+from tqdm import tqdm
+
+
 class GaussianDiffusion(nn.Module):
     __doc__ = r"""Gaussian Diffusion model. Forwarding through the module returns diffusion reversal scalar loss tensor.
 
@@ -34,6 +37,7 @@ class GaussianDiffusion(nn.Module):
         img_channels,
         num_classes,
         betas,
+        marginal_prob_std_fn,
         loss_type="l2",
         ema_decay=0.9999,
         ema_start=5000,
@@ -42,6 +46,7 @@ class GaussianDiffusion(nn.Module):
         super().__init__()
 
         self.model = model
+        self.marginal_prob_std_fn = marginal_prob_std_fn
         self.ema_model = deepcopy(model)
 
         self.ema = EMA(ema_decay)
@@ -112,6 +117,37 @@ class GaussianDiffusion(nn.Module):
                 x += extract(self.sigma, t_batch, x.shape) * torch.randn_like(x)
         
         return x.cpu().detach()
+    
+    def sample_score_based_model(self, marginal_prob_std, diffusion_coeff, num_steps, batch_size=64, x_shape=(1,28,28), device='cuda', eps=1e-3, y=None):
+        """Generate samples from score-based models with the Euler-Maruyama solver."""
+        # Initialize time to ones
+        t = torch.ones(batch_size, device=device)
+
+        # Generate initial noise
+        init_x = torch.randn(batch_size, *x_shape, device=device) * marginal_prob_std(t)[:, None, None, None]
+
+        # Create time steps for sampling
+        time_steps = torch.linspace(1.0, eps, num_steps, device=device)
+
+        # Calulate step size
+        step_size = time_steps[0] - time_steps[1]
+
+        # Set initial x
+        x = init_x
+
+        # Sampling loop
+        with torch.no_grad():
+            for time_step in tqdm(time_steps):
+                # Create a batch of current time step
+                batch_time_step = torch.ones(batch_size, device=device) * time_step
+                # Get diffusion coefficient
+                g = diffusion_coeff(batch_time_step)
+                # Calculate mean update
+                mean_x = x + (g**2)[:, None, None, None] * self.model(x, batch_time_step, y=y) * step_size
+                # Update x with noise
+                x = mean_x + torch.sqrt(step_size) * g[:, None, None, None] * torch.randn_like(x)
+        # Do not include any noise in the last sampling step.
+        return mean_x
 
     @torch.no_grad()
     def sample_diffusion_sequence(self, batch_size, device, y=None, noisy_image=None, use_ema=True):
@@ -144,17 +180,25 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_alphas_cumprod, t, x.shape) * x +
             extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * noise
         )   
+    
+    def add_scaled_noise(self, x, std, noise):
+        return x + noise * std[:, None, None, None]
 
     def get_losses(self, x, t, y):
         noise = torch.randn_like(x)
 
-        perturbed_x = self.perturb_x(x, t, noise)
-        estimated_noise = self.model(perturbed_x, t, y)
+        # compute the standard deviation of the noise at sampled time step
+        std = self.marginal_prob_std_fn(t)
+        perturbed_x = self.add_scaled_noise(x, std, noise)
+
+        #perturbed_x = self.perturb_x(x, t, noise)
+        score = self.model(perturbed_x, t, y)
 
         if self.loss_type == "l1":
-            loss = F.l1_loss(estimated_noise, noise)
+            loss = F.l1_loss(score, noise)
         elif self.loss_type == "l2":
-            loss = F.mse_loss(estimated_noise, noise)
+            #loss = F.mse_loss(estimated_noise, noise)
+            loss = F.mse_loss(score * std[:, None, None, None], -noise, reduction='mean')
 
         return loss
 
@@ -167,7 +211,10 @@ class GaussianDiffusion(nn.Module):
         if w != self.img_size[0]:
             raise ValueError("image width does not match diffusion parameters")
         
-        t = torch.randint(0, self.num_timesteps, (b,), device=device)
+        # sample timesteps
+        #t = torch.randint(0, self.num_timesteps, (b,), device=device)
+        eps = 1e-5
+        t = torch.rand(x.shape[0], device=x.device) * (1. - eps) + eps
         return self.get_losses(x, t, y)
 
 

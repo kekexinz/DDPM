@@ -298,4 +298,6 @@ class UNet(nn.Module):
         h = self.act(self.tgnorm2(self.tconv2(h + h2) + self.dense7(time_emb)))
         h = self.tconv1(h + h1)
 
+        # Normalize predicted noise by std at time t
+        h = h / self.marginal_prob_std(time)[:, None, None, None]
         return h

@@ -1,6 +1,9 @@
 import argparse
 import datetime
 import torch
+import functools
+from tqdm import trange
+
 
 from torch.utils.data import DataLoader
 import torchvision
@@ -11,11 +14,13 @@ from ddpm import script_utils
 def main():
     args = create_argparser().parse_args()
     device = args.device
-    print(args.time_emb_dim)
-    print(args.learning_rate)
-    print(args.batch_size)
+    
     try:
         diffusion = script_utils.get_diffusion_from_args(args).to(device)
+        total_params = sum(p.numel() for p in diffusion.model.parameters())
+        trainable_params = sum(p.numel() for p in diffusion.parameters() if p.requires_grad)
+        print(f"Total parameters: {total_params}, Trainable parameters: {trainable_params}")
+        print("-----------------------------")
         optimizer = torch.optim.Adam(diffusion.parameters(), lr=args.learning_rate)
 
         if args.model_checkpoint is not None:
@@ -50,12 +55,13 @@ def main():
 
         print("Starting training")
         
+        # initialize training loss
         acc_train_loss = 0
 
         # Open a file to log metrics
         metrics_file = open(f"{args.log_dir}/metrics.log", "w")
 
-        for iteration in range(1, args.iterations + 1):
+        for iteration in trange(args.iterations):
             diffusion.train()
 
             x, y = next(train_loader)
@@ -67,17 +73,17 @@ def main():
             else:
                 loss = diffusion(x)
 
+            # Backpropagation and optimization
             acc_train_loss += loss.item()
-
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             diffusion.update_ema()
             
             if iteration % args.log_rate == 0:
                 test_loss = 0
                 with torch.no_grad():
+                    # testing mode, disable dropout and gradient calculation
                     diffusion.eval()
                     for x, y in test_loader:
                         x = x.to(device)
@@ -136,8 +142,8 @@ def create_argparser():
     defaults = dict(
         learning_rate=10e-4,
         batch_size=1024,
-        iterations=1000,
-        log_rate=10,
+        iterations=5000,
+        log_rate=100,
         time_emb_dim=128,
         checkpoint_rate=1000,
         log_dir="./ddpm_logs",
