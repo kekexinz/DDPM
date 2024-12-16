@@ -2,12 +2,15 @@ import argparse
 import datetime
 import torch
 import functools
-from tqdm import trange
+from tqdm import trange, tqdm
 
-
+from torchvision.datasets import MNIST
+import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import torchvision
 from torchvision import datasets
+from torch.optim.lr_scheduler import LambdaLR
+
 from ddpm import script_utils
 
 
@@ -18,10 +21,10 @@ def main():
     try:
         diffusion = script_utils.get_diffusion_from_args(args).to(device)
         total_params = sum(p.numel() for p in diffusion.model.parameters())
-        trainable_params = sum(p.numel() for p in diffusion.parameters() if p.requires_grad)
+        trainable_params = sum(p.numel() for p in diffusion.model.parameters() if p.requires_grad)
         print(f"Total parameters: {total_params}, Trainable parameters: {trainable_params}")
         print("-----------------------------")
-        optimizer = torch.optim.Adam(diffusion.parameters(), lr=args.learning_rate)
+        
 
         if args.model_checkpoint is not None:
             diffusion.load_state_dict(torch.load(args.model_checkpoint))
@@ -29,109 +32,45 @@ def main():
             optimizer.load_state_dict(torch.load(args.optim_checkpoint))
 
         batch_size = args.batch_size
+        dataset = MNIST(root='./data', train=True, transform=transforms.ToTensor(), download=True)
+        data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
-        train_dataset = datasets.MNIST(
-            root='./data',
-            train=True,
-            download=True,
-            transform=script_utils.get_transform(),
-        )
-
-        test_dataset = datasets.MNIST(
-            root='./data',
-            train=False,
-            download=True,
-            transform=script_utils.get_transform(),
-        )
-
-        train_loader = script_utils.cycle(DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=2,
-        ))
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, drop_last=True, num_workers=2)
+        optimizer = torch.optim.Adam(diffusion.model.parameters(), lr=args.learning_rate)
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: max(0.2, 0.98 ** epoch))
+        tqdm_epoch = trange(args.iterations)
 
         print("Starting training")
         
-        # initialize training loss
-        acc_train_loss = 0
+        for epoch in tqdm(tqdm_epoch):
+            avg_loss = 0.
+            num_items = 0
+            for x, y in tqdm(data_loader):
+                x = x.to(device)
+                y = y.to(device)
 
-        # Open a file to log metrics
-        metrics_file = open(f"{args.log_dir}/metrics.log", "w")
-
-        for iteration in trange(args.iterations):
-            diffusion.train()
-
-            x, y = next(train_loader)
-            x = x.to(device)
-            y = y.to(device)
-
-            if args.use_labels:
-                loss = diffusion(x, y)
-            else:
-                loss = diffusion(x)
-
-            # Backpropagation and optimization
-            acc_train_loss += loss.item()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            #diffusion.update_ema()
-            
-            if iteration % args.log_rate == 0:
-                test_loss = 0
-                with torch.no_grad():
-                    # testing mode, disable dropout and gradient calculation
-                    diffusion.eval()
-                    for x, y in test_loader:
-                        x = x.to(device)
-                        y = y.to(device)
-
-                        if args.use_labels:
-                            loss = diffusion(x, y)
-                        else:
-                            loss = diffusion(x)
-
-                        test_loss += loss.item()
-                
                 if args.use_labels:
-                    samples = diffusion.sample(10, device, y=torch.arange(10, device=device))
+                    loss = diffusion(x, y)
                 else:
-                    samples = diffusion.sample(10, device)
-                
-                samples = ((samples + 1) / 2).clip(0, 1).permute(0, 2, 3, 1).numpy()
+                    loss = diffusion(x)
 
-                test_loss /= len(test_loader)
-                acc_train_loss /= args.log_rate
-                
-                # Log metrics to file
-                log_message = (
-                    f"Iteration {iteration}, "
-                    f"Train Loss: {acc_train_loss:.4f}, "
-                    f"Test Loss: {test_loss:.4f}"
-                )
-                print(log_message)
-                metrics_file.write(log_message + "\n")
+                # Backpropagation and optimization
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                avg_loss += loss.item() * x.shape[0]
+                num_items += x.shape[0]
 
-                # Save samples
-                for idx, sample in enumerate(samples):
-                    sample_path = f"{args.log_dir}/sample_{iteration}_{idx}.png"
-                    torchvision.utils.save_image(
-                        torch.tensor(sample).permute(2, 0, 1), sample_path
-                    )
-
-                acc_train_loss = 0
+                if epoch % 10 == 0:
+                    print(f"Epoch: {epoch}, Loss: {loss:5f}")
             
-            if iteration % args.checkpoint_rate == 0:
-                model_filename = f"{args.log_dir}/{args.project_name}-{args.run_name}-iteration-{iteration}-model.pth"
-                optim_filename = f"{args.log_dir}/{args.project_name}-{args.run_name}-iteration-{iteration}-optim.pth"
-
-                torch.save(diffusion.state_dict(), model_filename)
-                torch.save(optimizer.state_dict(), optim_filename)
-        
-        metrics_file.close()
+            scheduler.step()
+            lr_current = scheduler.get_last_lr()[0]
+            print('{} Average Loss: {:5f} lr {:.1e}'.format(epoch, avg_loss / num_items, lr_current))
+            # Print the averaged training loss so far.
+            tqdm_epoch.set_description('Average Loss: {:5f}'.format(avg_loss / num_items))
+            # Update the checkpoint after each epoch of training.
+            torch.save(diffusion.state_dict(), f'ckpt_score_based_model.pth')
+            
     except KeyboardInterrupt:
         print("Keyboard interrupt, run finished early")
 
@@ -142,7 +81,7 @@ def create_argparser():
     defaults = dict(
         learning_rate=10e-4,
         batch_size=1024,
-        iterations=5000,
+        iterations=100,
         log_rate=100,
         time_emb_dim=128,
         checkpoint_rate=1000,
