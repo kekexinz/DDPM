@@ -29,6 +29,15 @@ def marginal_prob_std(t, sigma):
     t = t.to(device)
     return torch.sqrt((sigma**(2 * t) - 1.) / 2. / np.log(sigma))
 
+def diffusion_coeff(t, sigma):
+  """Compute the diffusion coefficient of our SDE.
+
+  Args:
+    t: A vector of time steps.
+    sigma: The $\sigma$ in our SDE.
+  """
+  return torch.tensor(sigma**t, device=device)
+
 class GaussianFourierProjection(nn.Module):
     def __init__(self, embed_dim, scale=30.):
         super().__init__()
